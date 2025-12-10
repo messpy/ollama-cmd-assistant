@@ -123,6 +123,8 @@ export OLM_LOG_DIR="$HOME/log"              # ログディレクトリ
 export OLM_LOG_FILE="$OLM_LOG_DIR/olm.log" # ログファイルパス
 ```
 
+**注意**: `OLM_LOG_FILE` の設定時には、`OLM_LOG_DIR` が既に定義されている必要があります。
+
 ### 出力制限
 ```bash
 export OLM_CMD_MAX_CHARS=1000      # コマンド出力の最大文字数
@@ -241,7 +243,7 @@ $ docker info
 
 ## ログ
 
-すべての実行履歴は `~/log/olm.log`（デフォルト）に記録されます:
+すべての実行履歴は `$HOME/log/olm.log`（デフォルト）に記録されます:
 
 ```bash
 # ログ確認
