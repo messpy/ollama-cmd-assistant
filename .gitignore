@@ -2,6 +2,8 @@
 __pycache__/
 *.py[codz]
 *$py.class
+uv.lock
+.python-version
 
 # C extensions
 *.so
