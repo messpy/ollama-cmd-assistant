@@ -119,8 +119,8 @@ olm --logs
 
 ### ログ設定
 ```bash
-export OLM_LOG_DIR="$HOME/log"          # ログディレクトリ
-export OLM_LOG_FILE="$LOG_DIR/olm.log" # ログファイルパス
+export OLM_LOG_DIR="$HOME/log"              # ログディレクトリ
+export OLM_LOG_FILE="$OLM_LOG_DIR/olm.log" # ログファイルパス
 ```
 
 ### 出力制限
