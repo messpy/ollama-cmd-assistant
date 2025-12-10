@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+import os
+import ollama
+import json
+from git import Repo, GitCommandError
+from typing import List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+import time
+
+# --- 設定 ---
+# 役割ごとのモデル設定（プライマリ -> セカンダリの順で試行）
+MODEL_ANALYST_PRIMARY = "qwen3-coder:480b-cloud"  # 優先モデル
+MODEL_ANALYST_SECONDARY = "qwen2:7b"              # フォールバック (ローカル)
+
+MODEL_COMMITTER_PRIMARY = "qwen3-coder:480b-cloud"
+MODEL_COMMITTER_SECONDARY = "qwen2:1.5b"          # フォールバック (ローカル)
+
+# サーバーのURL
+OLLAMA_URL = "http://localhost:11434"
+# LLMへの同時リクエスト数 (Ollamaサーバーの性能に合わせて調整)
+MAX_WORKERS = 2
+# AI設計書/ログファイルのパス (コミット対象から**必ず除外**する)
+LOG_FILE = "auto_commit_log.json"
+# ファイル処理の最大制限時間（秒）。これを超えると定型メッセージでコミットする。
+FILE_PROCESSING_TIMEOUT = 120
+# ファイル読み込みを試行する一般的なエンコーディング
+COMMON_ENCODINGS = ["utf-8", "shift_jis", "euc_jp"]
+
+
+# --- ユーティリティ関数 ---
+
+def get_installed_models(client: ollama.Client) -> List[str]:
+    """Ollamaにインストールされているモデルのリストを取得する"""
+    try:
+        models = client.list()
+
+        model_list: List[str] = []
+        for m in models.get("models", []):
+            if "name" in m:
+                model_list.append(m["name"])
+            elif "model" in m:
+                model_list.append(m["model"])
+
+        return model_list
+
+    except Exception as e:
+        error_msg = str(e)
+        if "Connection refused" in error_msg or "Failed to connect" in error_msg:
+            print(
+                "🚨 **致命的エラー**: Ollamaサーバーへの接続に失敗しました。"
+                "`ollama serve` が実行されていることを確認してください。"
+            )
+        else:
+            print(f"🚨 **予期せぬエラー**: モデルリストの取得中に予期せぬエラーが発生しました: {e}")
+        return []
+
+
+def check_and_pull_models(client: ollama.Client) -> None:
+    """必要なフォールバックモデルがインストールされているか確認する"""
+    required_secondary = [MODEL_ANALYST_SECONDARY, MODEL_COMMITTER_SECONDARY]
+    installed = get_installed_models(client)
+
+    # 接続自体が死んでいる場合
+    if not installed and not getattr(client, "_session", None):
+        exit(1)
+
+    print("\n--- 🧠 LLMモデルの確認 ---")
+
+    all_secondary_ready = True
+    for required_model in required_secondary:
+        found = any(required_model in installed_name for installed_name in installed)
+
+        if not found:
+            print(f"⚠️ フォールバックモデル **{required_model}** が見つかりません。")
+            print(f"   アドバイス: コマンドラインで `ollama pull {required_model}` を実行してください。")
+            all_secondary_ready = False
+        else:
+            print(f"✅ フォールバックモデル **{required_model}** はインストール済みです。")
+
+    if not all_secondary_ready:
+        print("\n⛔ 重要なフォールバックモデルが揃っていません。プライマリモデルが使えない場合、処理が継続できません。")
+
+
+def generate_message(
+    client: ollama.Client,
+    primary_model: str,
+    secondary_model: str,
+    prompt: str,
+    file_path: str,
+    task_name: str,
+) -> str:
+    """プライマリモデルを試行し、失敗した場合セカンダリモデルにフォールバックする"""
+
+    models_to_try = [primary_model, secondary_model]
+
+    for i, model in enumerate(models_to_try):
+        if i > 0:
+            print(
+                f"⚠️ **{models_to_try[0]}** が失敗したため、"
+                f"**フォールバック**として **{model}** を試行します。"
+            )
+
+        print(f"⏳ **[{model}]** {file_path} の {task_name} を思考中...", end="", flush=True)
+
+        try:
+            # LLM API呼び出し
+            response = client.chat(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "あなたはプロのエンジニアで、簡潔で正確な説明、"
+                                   "または的確なアドバイスを日本語で行います。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                options={"temperature": 0.3},
+            )
+            print(" ✅ 完了")
+
+            content = response.get("message", {}).get("content", "").strip()
+            if not content:
+                raise ValueError(f"LLM ({model}) からの応答内容が空でした。")
+
+            # LLM出力クリーンアップ
+            content = content.replace("```json", "").replace("```", "").strip()
+            content = "\n".join([line.strip() for line in content.splitlines() if line.strip()])
+
+            return content
+
+        except Exception as e:
+            print(f" ❌ 失敗 ({e.__class__.__name__})")
+            if i == len(models_to_try) - 1:
+                print(f"🚨 **LLM応答生成エラー**: 全てのモデルでの処理に失敗しました: {e}")
+                return "LLM応答生成に失敗しました。"
+
+
+def get_file_content(repo_path: str, file_path: str, is_untracked: bool) -> Tuple[str, str]:
+    """ファイルの差分または内容を取得する（未ステージ / ステージ済み両方対応）"""
+
+    try:
+        repo = Repo(repo_path)
+    except Exception as e:
+        return f"Gitリポジトリの再初期化エラー: {e}", "E"
+
+    status: str = ""
+    content: str = ""
+
+    try:
+        # HEAD が有効かどうか判定
+        has_head = True
+        try:
+            _ = repo.head.commit
+        except Exception:
+            has_head = False
+
+        if is_untracked:
+            status = "A"
+        else:
+            # 未ステージ差分（index vs working tree）
+            diffs_wc = repo.index.diff(None)
+
+            found_diff = False
+
+            # まず未ステージから探す
+            for diff_item in diffs_wc:
+                if diff_item.a_path == file_path or diff_item.b_path == file_path:
+                    status = diff_item.change_type
+                    found_diff = True
+                    break
+
+            # HEAD がある場合だけステージ済み差分も見る
+            if not found_diff and has_head:
+                diffs_staged = repo.index.diff("HEAD")
+                for diff_item in diffs_staged:
+                    if diff_item.a_path == file_path or diff_item.b_path == file_path:
+                        status = diff_item.change_type
+                        found_diff = True
+                        break
+
+            # HEAD 無し（初回コミット前）で diff から拾えなかったものは「追加(A)」扱い
+            if not found_diff and not has_head:
+                status = "A"
+                found_diff = True
+
+            if not found_diff:
+                status = "?"
+                return f"ファイル: {file_path} の変更ステータスが見つかりません。", "E"
+
+        if status == "D":
+            content = f"ファイル: {file_path} が削除されました。"
+
+        elif status == "A":
+            full_path = os.path.join(repo.working_tree_dir, file_path)
+
+            # 複数のエンコーディングを試行
+            read_success = False
+            for encoding in COMMON_ENCODINGS:
+                try:
+                    with open(full_path, "r", encoding=encoding) as f:
+                        content = f.read()
+                        read_success = True
+                        break
+                except UnicodeDecodeError:
+                    continue
+                except Exception as e:
+                    return f"ファイル内容の読み込みエラー: {e}", "E"
+
+            if not read_success:
+                return (
+                    "ファイル内容の読み込みエラー: 複数のエンコーディング "
+                    f"({', '.join(COMMON_ENCODINGS)}) でデコードできませんでした。",
+                    "E",
+                )
+
+        elif status == "M":
+            try:
+                # 差分を取得（HEAD との差分）
+                if has_head:
+                    content = repo.git.diff("HEAD", file_path)
+                else:
+                    # HEAD 無しなら、とりあえず現行ファイル丸ごと
+                    full_path = os.path.join(repo.working_tree_dir, file_path)
+                    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+            except GitCommandError as e:
+                return f"Git Diffコマンドエラーが発生しました: {e.stderr.strip()}", "E"
+
+        elif status in ("R", "C"):  # Rename, Copy
+            return (
+                f"ファイル: {file_path} はリネーム/コピーされました。複雑な変更のためスキップします。",
+                "E",
+            )
+        else:
+            status = "?"
+            return (
+                f"ファイル: {file_path} は複雑なステータス ({status}) です。手動でコミットしてください。",
+                "E",
+            )
+
+        return content, status
+
+    except Exception as e:
+        return f"ファイル処理中に予期せぬエラーが発生しました: {e}", "E"
+
+
+# 非同期実行タスク
+def process_file_and_generate_messages(
+    client_host: str, repo_path: str, file_path: str, is_untracked: bool
+) -> Dict[str, Any]:
+    """単一ファイルの変更を解析し、コミットメッセージを生成する（非同期実行対象）"""
+
+    client = ollama.Client(host=client_host)
+
+    result: Dict[str, Any] = {
+        "file_path": file_path,
+        "status": "",
+        "diff_content": "",
+        "analysis_message": None,
+        "commit_message": None,
+        "error_advice": None,
+    }
+
+    diff_content, status = get_file_content(repo_path, file_path, is_untracked)
+    result["status"] = status
+    result["diff_content"] = diff_content
+
+    if status == "E":
+        result["error_advice"] = f"ファイル内容取得エラー: {diff_content}"
+        return result
+
+    # LLMによる変更内容の解説（ANALYSIS_MESSAGE）
+    analysis_prompt = (
+        "以下のGitの差分/ファイル内容を分析し、**変更されたファイル名**、"
+        "**変更種別 (新規追加/修正/削除)**、**変更の目的**、**主な変更点**を日本語で簡潔に"
+        "**箇条書きで解説してください**。**全体の文字数は300文字以内**に抑えてください。\n\n"
+        f"差分/内容:\n{diff_content}"
+    )
+    analysis_message = generate_message(
+        client,
+        MODEL_ANALYST_PRIMARY,
+        MODEL_ANALYST_SECONDARY,
+        analysis_prompt,
+        file_path,
+        "内容解析",
+    )
+    result["analysis_message"] = analysis_message
+
+    if analysis_message == "LLM応答生成に失敗しました。":
+        result["error_advice"] = analysis_message
+        return result
+
+    # LLMによるコミットメッセージの作成（COMMIT_MESSAGE）
+    commit_prompt = (
+        "以下の情報に基づき、Gitのコミットメッセージ（**一行目**は**厳密に50文字以内**の概要、"
+        "**二行目以降**は詳細な説明）を日本語で作成してください。"
+        "**応答全体にMarkdownのコードブロック記号（```）は使用しないでください**。\n\n"
+        f"ステータス: {status} (A:追加, M:修正, D:削除)\n\n変更解説:\n{analysis_message}"
+    )
+    commit_message = generate_message(
+        client,
+        MODEL_COMMITTER_PRIMARY,
+        MODEL_COMMITTER_SECONDARY,
+        commit_prompt,
+        file_path,
+        "コミットメッセージ作成",
+    )
+    result["commit_message"] = commit_message
+
+    if commit_message == "LLM応答生成に失敗しました。":
+        result["error_advice"] = commit_message
+
+    return result
+
+
+# ログ書き出し関数
+def write_log(repo_root: str, log_data: Dict[str, Any]) -> None:
+    """AI設計書/ログファイルを書き出す"""
+    log_path = os.path.join(repo_root, LOG_FILE)
+
+    try:
+        logs: Dict[str, Any] = {}
+        if os.path.exists(log_path):
+            with open(log_path, "r", encoding="utf-8") as f:
+                try:
+                    logs = json.load(f)
+                except json.JSONDecodeError:
+                    print(f"🚨 ログファイル {LOG_FILE} の解析に失敗しました。新しいログで上書きします。")
+
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        logs[timestamp] = log_data
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(logs, f, ensure_ascii=False, indent=4)
+        print(f"\n📝 AI設計書/ログをファイル **{LOG_FILE}** に書き込みました。")
+
+    except Exception as e:
+        print(f"\n🚨 ログファイル **{LOG_FILE}** の書き込み中にエラーが発生しました: {e}")
+
+
+# エラーアドバイス専用のLLM呼び出し
+def get_error_advice(client: ollama.Client, error_context: str) -> str:
+    """エラー発生時にユーザー向けのアドバイスを生成する"""
+    advice_prompt = (
+        "以下の問題/エラーが発生しました。ユーザーにGitの操作やファイルの状態について、"
+        "簡潔で具体的な日本語のアドバイスを提供してください。\n\n"
+        f"問題: {error_context}"
+    )
+
+    try:
+        response = client.chat(
+            model=MODEL_COMMITTER_SECONDARY,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "あなたはシステム管理者で、発生したエラーに対する具体的な"
+                               "解決策を日本語で提示します。",
+                },
+                {"role": "user", "content": advice_prompt},
+            ],
+            options={"temperature": 0.3},
+        )
+        advice = response.get("message", {}).get("content", "").strip()
+        advice = advice.replace("```json", "").replace("```", "").strip()
+        advice = "\n".join([line.strip() for line in advice.splitlines() if line.strip()])
+        return advice if advice else "（LLMによるアドバイス生成が空でした）"
+    except Exception:
+        return "（LLMによるアドバイス生成中にエラーが発生しました。ローカルモデルが利用可能か確認してください）"
+
+
+# 最終結果を整形して表示する関数
+def display_summary(results: List[Dict[str, Any]]) -> None:
+    """コミットされたファイルとスキップされたファイルの結果を一覧表示する"""
+    committed = [r for r in results if r.get("commit_sha")]
+    skipped = [r for r in results if not r.get("commit_sha") and r.get("file") != LOG_FILE]
+
+    print("\n" + "=" * 80)
+    print("=== 🌟 最終コミット結果サマリー 🌟 ===")
+    print("=" * 80)
+
+    if committed:
+        print(f"## ✅ コミット成功ファイル ({len(committed)}件)")
+        for r in committed:
+            file_path = r["file"]
+            commit_msg_summary = (
+                r["messages"]["commit"].splitlines()[0] if r["messages"]["commit"] else "(メッセージなし)"
+            )
+            print(f"\n### 📄 {file_path} (SHA: {r['commit_sha']})")
+            print("**差分（Git Diffからの差分を要約）:**")
+            print(r["messages"]["analysis"] or "(AI解析メッセージなし)")
+            print("**コミットメッセージ:**")
+            print(f"> {commit_msg_summary}")
+        print("-" * 40)
+    else:
+        print("## ✅ コミット成功ファイル (0件)")
+        print("コミットされたファイルはありませんでした。")
+        print("-" * 40)
+
+    if skipped:
+        print(f"\n## ❌ スキップ/エラーファイル ({len(skipped)}件)")
+        for r in skipped:
+            file_path = r["file"]
+            error_reason = r["error"] or "(コミット操作中にエラー)"
+
+            print(f"\n### ⚠️ {file_path}")
+            print("**❌ 処理失敗/スキップ理由:**")
+            print(f"> {error_reason.splitlines()[0]}...")
+            if r["messages"].get("commit"):
+                print("**💬 メッセージ案 (参考):**")
+                print(f"> {r['messages']['commit'].splitlines()[0]}")
+        print("-" * 40)
+
+    print("=" * 80)
+
+
+def display_file_commit_detail(repo: Repo, client: ollama.Client, log_entry: Dict[str, Any]) -> bool:
+    """単一ファイルのLLM結果詳細を表示し、ステージングと即時コミットを実行する"""
+    file_path = log_entry["file"]
+    res = log_entry["messages"]
+    status = log_entry["status"]
+
+    print(f"\n### 📄 ファイル: {file_path} (ステータス: {status}) ###")
+
+    # エラーまたはメッセージ生成失敗の場合
+    if log_entry.get("error") or res.get("commit") in ("LLM応答生成に失敗しました.", None, ""):
+
+        error_msg = log_entry.get("error") or "LLMメッセージ生成失敗"
+        print("🚨 **処理スキップ**:")
+        print(f"> {error_msg}")
+
+        # タイムアウトの場合、定型メッセージコミットの提案を行う
+        if "LLM処理がタイムアウト" in error_msg:
+            # タイムアウト時はコミットメッセージが生成されているため、ここでコミットに進む
+            # （この関数は元々、エラーの場合はFalseを返す設計だが、今回はタイムアウト時は別経路でコミット成功させたい）
+            pass  # 後続のコミット実行ロジックに進ませる
+
+        # LLM応答失敗以外の場合にのみアドバイスを生成
+        elif "LLM応答生成に失敗しました" not in error_msg:
+            advice = get_error_advice(client, error_msg)
+            print(f"💡 LLMからのアドバイス:\n{advice}")
+            return False  # 失敗
+
+    # 正常にメッセージが生成された場合、またはタイムアウトでフォールバックメッセージがある場合
+
+    print("\n**内容 (処理内容要約)**")
+    print(res["analysis"])
+
+    print("**差分（Git Diffからの差分を要約）**")
+    diff_content = log_entry.get("diff_content", "（差分内容の取得に失敗）")
+
+    truncated_diff = diff_content[:500]
+    suffix = "\n... (以下省略)\n" if len(diff_content) > 500 else "\n"
+
+    print(f"```diff\n{truncated_diff}{suffix}```")
+
+    print("**コミットメッセージ**")
+    print("---")
+    print(res["commit"])
+    print("---")
+
+    # --- ステージング＆即時コミット実行 ---
+    try:
+        # 1. ステージング
+        if status == "D":
+            # 削除されたファイルは git rm 相当で index から削除
+            repo.git.rm(file_path)
+            print(f"削除ファイル {file_path} をステージングしました (git rm 相当)")
+        else:
+            # 追加・修正 (A/M など) は add でOK
+            repo.index.add([file_path])
+            print("✅ **ステージング成功**")
+
+        # 2. コミット実行
+        commit_message = res["commit"].strip()
+        if not commit_message:
+            raise ValueError("LLM/フォールバックが空のコミットメッセージを生成しました。")
+
+        new_commit = repo.index.commit(commit_message)
+
+        log_entry["commit_sha"] = new_commit.hexsha[:8]
+
+        if "TIMEOUT_FALLBACK" in log_entry["analyzed_by"]:
+            print(
+                "⚠️ **コミット完了（フォールバック）**: "
+                f"ファイル {file_path} を定型メッセージでコミットしました。SHA: {new_commit.hexsha[:8]}"
+            )
+        else:
+            print(
+                "🎉 **コミット完了**: "
+                f"ファイル {file_path} を個別にコミットしました。SHA: {new_commit.hexsha[:8]}"
+            )
+
+        return True  # コミット成功
+
+    except GitCommandError as e:
+        error_detail = e.stderr.strip()
+        print(f"🚨 **Git操作エラー**: {file_path} のコミットに失敗: {error_detail}")
+        log_entry["error"] = f"Git Commit Failed: {error_detail}"
+
+        if "hook failed" in error_detail or "pre-commit" in error_detail:
+            print(
+                "⚠️ **重要**: コミット操作中に Gitフックが失敗しました。"
+                "フック (例: pre-commit) の出力がエラーメッセージに含まれている可能性があります。"
+            )
+
+        # コミットに失敗した場合、ステージングを解除
+        try:
+            repo.index.reset([file_path], working_tree=False)
+            print(f"❌ ファイル {file_path} のステージングを解除しました。")
+        except Exception:
+            pass
+
+        advice = get_error_advice(client, log_entry["error"])
+        print(f"💡 LLMからのアドバイス:\n{advice}")
+        return False  # コミット失敗
+
+    except Exception as e:
+        error_message = str(e)
+        print(f"🚨 **予期せぬエラー**: {file_path} のコミット中にエラーが発生: {error_message}")
+        log_entry["error"] = f"Unexpected Error: {error_message}"
+
+        # 予期せぬエラーの場合もステージングを解除
+        try:
+            repo.index.reset([file_path], working_tree=False)
+            print(f"❌ ファイル {file_path} のステージングを解除しました。")
+        except Exception:
+            pass
+
+        advice = get_error_advice(client, log_entry["error"])
+        print(f"💡 LLMからのアドバイス:\n{advice}")
+        return False  # コミット失敗
+
+
+def main() -> None:
+    """メイン処理"""
+    print("--- 🤖 Ollama Git Auto-Commit Tool 🚀 ---")
+
+    # 1. リポジトリの確認
+    try:
+        # 親ディレクトリも含めて .git を探索
+        repo = Repo(os.getcwd(), search_parent_directories=True)
+        repo_root = repo.working_tree_dir
+        print(f"✅ Gitリポジトリを確認しました。ルートディレクトリ: {repo_root}")
+    except GitCommandError:
+        print("🚨 エラー: `.git` ディレクトリが見つかりません。")
+        return
+    except Exception as e:
+        print(f"🚨 予期せぬリポジトリ初期化エラー: {e}")
+        return
+
+    # HEAD が存在するか（= 1回以上コミットされているか）を判定
+    has_head = True
+    try:
+        _ = repo.head.commit
+    except Exception:
+        has_head = False
+
+    # 2. Ollamaクライアントとモデルのチェック
+    client = ollama.Client(host=OLLAMA_URL)
+    check_and_pull_models(client)
+
+    # ★ カレントディレクトリとリポジトリルートの関係を先に計算
+    cwd = os.getcwd()
+    try:
+        rel_cwd = os.path.relpath(cwd, repo_root)  # 例: "ollajio"
+    except ValueError:
+        # 何かおかしくても、とりあえずルート扱いにしておく
+        rel_cwd = "."
+
+    # 3. 処理対象ファイルリストの作成
+    # 未ステージの差分（index vs working tree）
+    unstaged_diffs = repo.index.diff(None)
+
+    # ステージ済みの差分
+    if has_head:
+        # 通常: HEAD と index の差分
+        staged_diffs = repo.index.diff("HEAD")
+    else:
+        # 初回コミット前: HEAD が無いので空
+        staged_diffs = []
+
+    # 未追跡ファイル
+    untracked_files = repo.untracked_files
+
+    target_files: Dict[str, bool] = {}
+
+    # 未ステージの変更
+    for diff in unstaged_diffs:
+        if diff.change_type in ("A", "M", "D", "T"):
+            file = diff.a_path or diff.b_path
+            if not repo.ignored(file) and file != LOG_FILE:
+                target_files[file] = False  # is_untracked = False
+
+    # ステージ済みの変更（未ステージと重複しないもの）
+    for diff in staged_diffs:
+        if diff.change_type in ("A", "M", "D", "T"):
+            file = diff.a_path or diff.b_path
+            if not repo.ignored(file) and file != LOG_FILE:
+                target_files.setdefault(file, False)
+
+    # 初回コミット前: index に載っているファイルを全部「追加(A)」として扱う
+    if not has_head:
+        for (path, stage), entry in repo.index.entries.items():
+            if stage != 0:
+                continue
+            if not repo.ignored(path) and path != LOG_FILE:
+                target_files.setdefault(path, False)
+
+    # 未追跡ファイル（★カレント配下だけ質問する）
+    for file in untracked_files:
+        if repo.ignored(file) or file == LOG_FILE:
+            continue
+
+        # 実行中スクリプト自身は無条件スキップ
+        if file == os.path.basename(__file__):
+            continue
+
+        # カレントディレクトリ配下だけに限定
+        if rel_cwd != ".":
+            prefix = rel_cwd.rstrip("/") + "/"
+            # 例:
+            #   rel_cwd = "ollajio"
+            #   file    = "ollajio/main.py" → OK
+            #   file    = "main.py"        → スキップ
+            #   file    = "kennybot/..."   → スキップ
+            if not (file == rel_cwd or file.startswith(prefix)):
+                continue
+
+        # ここまで来た untracked だけ質問
+        answer = input(
+            f"\n⚠️  未追跡ファイル **{file}** をコミット対象に含めますか？ (y/n): "
+        ).strip().lower()
+        if answer == "y":
+            target_files[file] = True  # is_untracked = True
+
+    # ★ 追加の保険: target_files をカレント配下だけに絞る
+    if rel_cwd != ".":
+        prefix = rel_cwd.rstrip("/") + "/"
+        filtered: Dict[str, bool] = {
+            path: flag
+            for path, flag in target_files.items()
+            if path == rel_cwd or path.startswith(prefix)
+        }
+        if not filtered:
+            print(f"✅ カレントディレクトリ配下 ({rel_cwd}) の変更はありません。処理を終了します。")
+            return
+        target_files = filtered
+
+    if not target_files:
+        print("✅ 処理対象の変更ファイルがありません。処理を終了します。")
+        return
+
+    print("\n--- 🔍 処理対象の変更ファイルリスト ---")
+    for path, is_untracked in target_files.items():
+        flag = "untracked" if is_untracked else "tracked"
+        print(f"- {path} ({flag})")
+
+    # 4. LLM並列処理によるメッセージ生成
+    all_results: Dict[str, Dict[str, Any]] = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                process_file_and_generate_messages, OLLAMA_URL, repo_root, file_path, is_untracked
+            ): file_path
+            for file_path, is_untracked in target_files.items()
+        }
+
+        print(f"\n--- ⚡️ LLM並列処理開始 (最大 {MAX_WORKERS} スレッド) ---")
+
+        for future in as_completed(futures):
+            file_path = futures[future]
+            try:
+                # タイムアウト設定
+                result = future.result(timeout=FILE_PROCESSING_TIMEOUT)
+                all_results[file_path] = result
+            except TimeoutError:
+                # タイムアウト時のフォールバック処理
+                print(
+                    f"\n🚨 **タイムアウト**: ファイル {file_path} の LLM 処理が "
+                    f"{FILE_PROCESSING_TIMEOUT} 秒を超過しました。フォールバック処理を実行します。"
+                )
+
+                _, status = get_file_content(repo_root, file_path, target_files[file_path])
+
+                commit_msg = f"{file_path}: 大規模ファイルの{status}を自動コミット (LLMタイムアウト)"
+                analysis_msg = (
+                    "LLM処理がタイムアウトしたため、ファイル名と状態に基づいて"
+                    "定型メッセージでコミットします。"
+                    f"ファイルの状態: {status}"
+                )
+
+                all_results[file_path] = {
+                    "file_path": file_path,
+                    "status": status,
+                    "diff_content": "（タイムアウトにより詳細差分取得スキップ）",
+                    "analysis_message": analysis_msg,
+                    "commit_message": commit_msg,
+                    "error_advice": f"LLM処理がタイムアウト ({FILE_PROCESSING_TIMEOUT}秒)。定型メッセージを生成しました。",
+                }
+
+            except Exception as e:
+                print(
+                    f"🚨 **スレッド実行時エラー**: "
+                    f"ファイル {file_path} の処理中に予期せぬエラーが発生しました: {e}"
+                )
+                all_results[file_path] = {
+                    "file_path": file_path,
+                    "error_advice": f"スレッド実行時エラー: {e}",
+                }
+
+    # 5. LLM処理結果のリアルタイム表示と即時コミット
+    log_data: Dict[str, Any] = {"processed_files": []}
+    committed_count = 0
+
+    print("\n" + "=" * 80)
+    print("=== ✅ LLM処理結果と即時個別コミット実行 ===")
+    print("=" * 80)
+
+    for file_path, is_untracked in target_files.items():
+        res = all_results.get(file_path)
+
+        if not res:
+            continue
+
+        log_entry: Dict[str, Any] = {
+            "file": file_path,
+            "status": res.get("status", "N/A"),
+            "analyzed_by": (
+                "TIMEOUT_FALLBACK"
+                if res.get("error_advice") and "LLM処理がタイムアウト" in res["error_advice"]
+                else MODEL_ANALYST_PRIMARY
+            ),
+            "commit_msg_by": (
+                "TIMEOUT_FALLBACK"
+                if res.get("error_advice") and "LLM処理がタイムアウト" in res["error_advice"]
+                else MODEL_COMMITTER_PRIMARY
+            ),
+            "commit_sha": None,
+            "messages": {
+                "analysis": res.get("analysis_message"),
+                "commit": res.get("commit_message"),
+            },
+            "diff_content": res.get("diff_content"),
+            "error": res.get("error_advice"),
+        }
+
+        if display_file_commit_detail(repo, client, log_entry):
+            committed_count += 1
+
+        # ログには diff_content は重いので消して保存
+        if "diff_content" in log_entry:
+            del log_entry["diff_content"]
+
+        log_data["processed_files"].append(log_entry)
+
+        print("-" * 40)
+
+    # 6. 最終結果の一覧表示
+    display_summary(log_data["processed_files"])
+
+    print(f"\n🏁 **合計**: {committed_count} 件の変更がコミットされました。")
+
+    # 7. ログ書き出し
+    write_log(repo_root, log_data)
+
+    # 8. プッシュ確認
+    if committed_count > 0:
+        answer = input("\n🚀 リモートリポジトリに今すぐプッシュしますか？ (y/n): ").strip().lower()
+        if answer == "y":
+            try:
+                origin = repo.remotes.origin
+                print("📤 git push origin を実行中...")
+                origin.push()
+                print("✅ リモートへのプッシュが完了しました。")
+            except Exception as e:
+                print(f"🚨 リモートへのプッシュ中にエラーが発生しました: {e}")
+        else:
+            print("ℹ️ 今回のコミットはローカルのみに保存されました。")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\n⛔ Ctrl+C により処理を中断しました。"
+            "中途半端なステージングが無いか `git status` で確認してください。"
+        )
